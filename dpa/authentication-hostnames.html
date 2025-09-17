@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>AAD Hostname Construction for Data Plane SDKs</title>
+  <style>
+    body { font-family: Arial, sans-serif; line-height: 1.6; margin: 2rem; }
+    h1, h2 { color: #0072C6; }
+    table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+    th, td { border: 1px solid #ccc; padding: 0.5rem; text-align: left; vertical-align: top; }
+    th { background: #f2f2f2; }
+    code { background: #f7f7f7; padding: 0.1rem 0.2rem; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <h1>AAD Hostname Construction for Data Plane SDKs</h1>
+  <p>This page summarizes how Microsoft Entra ID (Azure AD) authentication determines the hostname (audience) for token requests in each Azure data-plane SDK listed in <code>dpa/scope.md</code>. The findings below focus exclusively on the Azure public cloud.</p>
+
+  <h2>Azure Storage (Blobs, Queues, Files Shares)</h2>
+  <ul>
+    <li><strong>Audience selection:</strong> Each client exposes an audience type (<code>BlobAudience</code>, <code>QueueAudience</code>, <code>ShareAudience</code>) with a default value of <code>https://storage.azure.com/</code>. This default is used to request tokens valid for any storage account. <code>Create*ServiceAccountAudience</code> helpers build an account-specific host such as <code>https://{account}.blob.core.windows.net/</code> by concatenating the storage account name with the service subdomain and Azure domain suffix.【F:sdk/storage/Azure.Storage.Blobs/src/Models/BlobAudience.cs†L33-L84】【F:sdk/storage/Azure.Storage.Queues/src/Models/QueueAudience.cs†L33-L84】【F:sdk/storage/Azure.Storage.Files.Shares/src/Models/ShareAudience.cs†L33-L84】</li>
+    <li><strong>Scope construction:</strong> When no explicit audience is provided, the clients call <code>AsPolicy</code> with the default storage scope (<code>https://storage.azure.com/.default</code>). If an audience is specified, <code>CreateDefaultScope</code> ensures the <code>/.default</code> suffix is appended to the host used for token acquisition.【F:sdk/storage/Azure.Storage.Common/src/Shared/StorageClientOptions.cs†L63-L99】【F:sdk/storage/Azure.Storage.Common/src/Shared/Constants.cs†L132-L132】【F:sdk/storage/Azure.Storage.Blobs/src/BlobServiceClient.cs†L250-L259】</li>
+    <li><strong>Challenge responses:</strong> For bearer challenges the storage policy reads the <code>authorization_uri</code> to capture the tenant (segment after the first <code>/</code>) and appends <code>/.default</code> to the <code>resource_id</code> returned by the service to rebuild a full scope. This means the host originates from the challenged resource, e.g., a specific account endpoint.【F:sdk/storage/Azure.Storage.Common/src/Shared/StorageBearerTokenChallengeAuthorizationPolicy.cs†L103-L125】</li>
+  </ul>
+  <p><em>Hostname meaning:</em></p>
+  <ul>
+    <li>Scheme <code>https://</code> – Azure AD resource identifiers are always HTTPS.</li>
+    <li>Host <code>storage.azure.com</code> – global storage resource when no account is targeted.</li>
+    <li>Host <code>{account}.&lt;service&gt;.core.windows.net</code> – account name + storage service subdomain (<code>blob</code>, <code>queue</code>, <code>file</code>) + Azure public cloud suffix.</li>
+  </ul>
+
+  <h2>Azure Data Tables</h2>
+  <ul>
+    <li><strong>Audience selection:</strong> <code>TableAudience</code> offers constants for several sovereign clouds; for the public cloud it chooses <code>https://storage.azure.com</code> (or <code>https://cosmos.azure.com</code> for premium endpoints). Custom values are allowed and used verbatim.【F:sdk/tables/Azure.Data.Tables/src/TableAudience.cs†L13-L86】</li>
+    <li><strong>Scope construction:</strong> <code>TableServiceClient</code> builds the policy with <code>audienceScope = (Audience ?? TableAudience.AzurePublicCloud).GetDefaultScope(...)</code>, which appends <code>/.default</code> unless the value already includes it. Premium (Cosmos) accounts flip the base host to the Cosmos domain, so the hostname embeds whether the tables live in Azure Storage or Cosmos DB.【F:sdk/tables/Azure.Data.Tables/src/TableServiceClient.cs†L264-L291】【F:sdk/tables/Azure.Data.Tables/src/TableAudience.cs†L66-L86】【F:sdk/tables/Azure.Data.Tables/src/TableConstants.cs†L8-L12】</li>
+    <li><strong>Challenge responses:</strong> When the service issues a challenge, the tables policy reads <code>authorization_uri</code> to discover the tenant ID (second URI segment), keeping the previously configured scopes for the host determined above.【F:sdk/tables/Azure.Data.Tables/src/TableBearerTokenChallengeAuthorizationPolicy.cs†L65-L88】</li>
+  </ul>
+  <p><em>Hostname meaning:</em></p>
+  <ul>
+    <li>Scheme <code>https://</code> – Azure AD resource URL requirement.</li>
+    <li>Host <code>storage.azure.com</code> – standard accounts backed by Azure Storage in the public cloud.</li>
+    <li>Host <code>cosmos.azure.com</code> – Azure Cosmos DB-backed tables when the endpoint is premium.</li>
+  </ul>
+
+  <h2>Azure Data App Configuration</h2>
+  <ul>
+    <li><strong>Audience selection:</strong> <code>ConfigurationClientOptions.GetDefaultScope</code> inspects the endpoint host suffix. For public cloud instances it selects <code>https://appconfig.azure.com</code>; custom audiences override this default.【F:sdk/appconfiguration/Azure.Data.AppConfiguration/src/ConfigurationClientOptions.cs†L73-L89】【F:sdk/appconfiguration/Azure.Data.AppConfiguration/src/AppConfigurationAudience.cs†L13-L56】</li>
+    <li><strong>Client usage:</strong> <code>ConfigurationClient</code> passes the computed scope into <code>BearerTokenAuthenticationPolicy</code>, so in the public cloud the hostname always resolves to the <code>appconfig.azure.com</code> resource.【F:sdk/appconfiguration/Azure.Data.AppConfiguration/src/ConfigurationClient.cs†L129-L148】</li>
+  </ul>
+  <p><em>Hostname meaning:</em></p>
+  <ul>
+    <li>Scheme <code>https://</code> – Azure AD resource URL.</li>
+    <li>Host <code>appconfig.azure.com</code> – App Configuration resource domain in the public cloud.</li>
+  </ul>
+
+  <h2>Azure Key Vault (Secrets, Keys, Certificates, Administration)</h2>
+  <ul>
+    <li><strong>Challenge-driven audience:</strong> Clients install <code>ChallengeBasedAuthenticationPolicy</code>, which waits for a 401 challenge and reads the <code>resource</code> or <code>scope</code> parameter (e.g., <code>https://vault.azure.net</code>) to establish the hostname. The policy verifies that the requested host ends with the same domain and caches the result for the vault authority.【F:sdk/keyvault/Azure.Security.KeyVault.Shared/src/ChallengeBasedAuthenticationPolicy.cs†L118-L188】</li>
+    <li><strong>Tenant discovery:</strong> The policy also parses the <code>authorization</code> URI to extract the tenant ID from the path segments, tying it to the challenge cache key along with the hostname.【F:sdk/keyvault/Azure.Security.KeyVault.Shared/src/ChallengeBasedAuthenticationPolicy.cs†L163-L175】【F:sdk/keyvault/Azure.Security.KeyVault.Shared/src/ChallengeBasedAuthenticationPolicy.cs†L266-L288】</li>
+  </ul>
+  <p><em>Hostname meaning:</em></p>
+  <ul>
+    <li>Scheme <code>https://</code> – enforced by the policy for security.</li>
+    <li>Host <code>vault.azure.net</code> (or regional equivalents) – indicates the Key Vault/Managed HSM domain. Subdomains (<code>{vault-name}.vault.azure.net</code>) represent the specific vault.</li>
+  </ul>
+
+  <h2>Azure Messaging Service Bus</h2>
+  <ul>
+    <li><strong>Default scope:</strong> Token-based clients use the constant <code>https://servicebus.azure.net/.default</code> as the scope when requesting AAD tokens, so the hostname is the global Service Bus resource identifier.【F:sdk/servicebus/Azure.Messaging.ServiceBus/src/Constants.cs†L40-L52】【F:sdk/servicebus/Azure.Messaging.ServiceBus/src/Authorization/ServiceBusTokenCredential.cs†L16-L88】</li>
+    <li><strong>Namespace-specific URIs:</strong> When building SAS audiences, <code>BuildAudienceResource</code> uses a <code>UriBuilder</code> around the fully qualified namespace to normalize <code>https://{namespace}.servicebus.windows.net</code> (lower-cased, path trimmed). This shows how the host components represent the customer namespace plus the service suffix.【F:sdk/servicebus/Azure.Messaging.ServiceBus/src/Administration/ServiceBusAdministrationClient.cs†L2703-L2738】</li>
+    <li><strong>HTTP management requests:</strong> The administration client requests tokens with <code>Constants.DefaultScope</code> whenever the credential is not SAS-based, reinforcing the same hostname for AAD.【F:sdk/servicebus/Azure.Messaging.ServiceBus/src/Administration/HttpRequestAndResponse.cs†L127-L136】</li>
+  </ul>
+  <p><em>Hostname meaning:</em></p>
+  <ul>
+    <li>Scheme <code>https://</code> – Azure AD requirement.</li>
+    <li>Host <code>servicebus.azure.net</code> – global AAD resource for Service Bus RBAC.</li>
+    <li>Host <code>{namespace}.servicebus.windows.net</code> – specific namespace used when signing SAS tokens (not AAD).</li>
+  </ul>
+
+  <h2>Azure Messaging Event Hubs</h2>
+  <ul>
+    <li><strong>Default scope:</strong> Event Hubs mirrors Service Bus, requesting tokens for <code>https://eventhubs.azure.net/.default</code> via <code>EventHubTokenCredential</code> and reusing that scope throughout AMQP operations.【F:sdk/eventhub/Azure.Messaging.EventHubs.Shared/src/Authorization/EventHubTokenCredential.cs†L16-L85】【F:sdk/eventhub/Azure.Messaging.EventHubs/src/Amqp/CbsTokenProvider.cs†L120-L168】</li>
+  </ul>
+  <p><em>Hostname meaning:</em></p>
+  <ul>
+    <li>Scheme <code>https://</code>.</li>
+    <li>Host <code>eventhubs.azure.net</code> – global Event Hubs resource identifier for RBAC.</li>
+  </ul>
+
+  <h2>Azure Messaging Event Grid</h2>
+  <ul>
+    <li><strong>Client scope:</strong> <code>EventGridPublisherClient</code> configures a <code>BearerTokenAuthenticationPolicy</code> with the fixed scope <code>https://eventgrid.azure.net/.default</code>, so the hostname directly maps to the Event Grid service domain regardless of the topic’s regional subdomain.【F:sdk/eventgrid/Azure.Messaging.EventGrid/src/EventGridPublisherClient.cs†L53-L67】</li>
+  </ul>
+  <p><em>Hostname meaning:</em></p>
+  <ul>
+    <li>Scheme <code>https://</code>.</li>
+    <li>Host <code>eventgrid.azure.net</code> – global Event Grid RBAC resource.</li>
+  </ul>
+
+  <h2>Summary Table</h2>
+  <table>
+    <thead>
+      <tr><th>SDK</th><th>How the hostname is derived</th><th>Hostname components</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Azure Storage (Blobs/Queues/Files)</td>
+        <td>Defaults to <code>https://storage.azure.com</code>, or <code>https://{account}.{service}.core.windows.net</code> when using account-specific audiences; challenges may return a <code>resource_id</code> that becomes the host before appending <code>/.default</code>.【F:sdk/storage/Azure.Storage.Blobs/src/Models/BlobAudience.cs†L33-L84】【F:sdk/storage/Azure.Storage.Common/src/Shared/StorageBearerTokenChallengeAuthorizationPolicy.cs†L103-L125】</td>
+        <td><code>https</code> scheme; optional account name + service subdomain + Azure domain; <code>/.default</code> scope suffix.</td>
+      </tr>
+      <tr>
+        <td>Azure Data Tables</td>
+        <td>Chooses <code>https://storage.azure.com</code> for standard accounts or <code>https://cosmos.azure.com</code> for premium endpoints in the public cloud; <code>GetDefaultScope</code> appends <code>/.default</code>.【F:sdk/tables/Azure.Data.Tables/src/TableAudience.cs†L66-L86】【F:sdk/tables/Azure.Data.Tables/src/TableServiceClient.cs†L264-L291】</td>
+        <td><code>https</code> + <code>storage</code> (standard) or <code>cosmos</code> (premium) domain; <code>/.default</code> suffix.</td>
+      </tr>
+      <tr>
+        <td>Azure Data App Configuration</td>
+        <td>Inspects the endpoint host suffix to select the public-cloud resource <code>appconfig.azure.com</code> and appends <code>/.default</code>, or uses a custom audience.【F:sdk/appconfiguration/Azure.Data.AppConfiguration/src/ConfigurationClientOptions.cs†L73-L89】</td>
+        <td><code>https</code> + <code>appconfig.azure.com</code>; <code>/.default</code> scope suffix.</td>
+      </tr>
+      <tr>
+        <td>Azure Key Vault (Secrets/Keys/Certificates/Admin)</td>
+        <td>Waits for a challenge and adopts the <code>resource</code>/<code>scope</code> hostname (e.g., <code>https://vault.azure.net</code>), verifying it matches the requested domain; tenant derived from <code>authorization</code> URI.【F:sdk/keyvault/Azure.Security.KeyVault.Shared/src/ChallengeBasedAuthenticationPolicy.cs†L118-L188】</td>
+        <td><code>https</code> + vault domain; subdomain identifies specific vault instance.</td>
+      </tr>
+      <tr>
+        <td>Azure Messaging Service Bus</td>
+        <td>Uses constant <code>https://servicebus.azure.net/.default</code> for AAD tokens; SAS hosts are normalized via <code>UriBuilder</code> using the namespace.【F:sdk/servicebus/Azure.Messaging.ServiceBus/src/Constants.cs†L40-L52】【F:sdk/servicebus/Azure.Messaging.ServiceBus/src/Administration/ServiceBusAdministrationClient.cs†L2703-L2738】</td>
+        <td><code>https</code> + <code>servicebus.azure.net</code> for RBAC tokens; namespace + <code>servicebus.windows.net</code> for SAS.</td>
+      </tr>
+      <tr>
+        <td>Azure Messaging Event Hubs</td>
+        <td>Tokens requested for <code>https://eventhubs.azure.net/.default</code>.【F:sdk/eventhub/Azure.Messaging.EventHubs.Shared/src/Authorization/EventHubTokenCredential.cs†L16-L85】</td>
+        <td><code>https</code> + <code>eventhubs.azure.net</code>.</td>
+      </tr>
+      <tr>
+        <td>Azure Messaging Event Grid</td>
+        <td>Uses <code>https://eventgrid.azure.net/.default</code> regardless of topic endpoint host.【F:sdk/eventgrid/Azure.Messaging.EventGrid/src/EventGridPublisherClient.cs†L53-L67】</td>
+        <td><code>https</code> + <code>eventgrid.azure.net</code>.</td>
+      </tr>
+    </tbody>
+  </table>
+</body>
+</html>
